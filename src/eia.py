@@ -74,12 +74,25 @@ def fetch_subregion_demand(subba, start, end, parent="MISO", verbose=True):
 
 
 if __name__ == "__main__":
-    df = fetch_subregion_demand(
-        subba="0027",
-        start="2018-07-01T00",
-        end="2026-09-17T00",
-    )
+    import os
+    from datetime import datetime, timezone
+
     out = "data/raw/miso_0027_load.csv"
-    df.to_csv(out, index=False)
-    print(f"\nSaved {len(df):,} rows to {out}")
-    print(df.head())
+    default_start = "2019-01-01T00"
+    end = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H")
+
+    if os.path.exists(out):
+        existing = pd.read_csv(out)
+        last = existing["period"].max()
+        print(f"Existing data ends at {last}. Fetching from there.")
+        new = fetch_subregion_demand(subba="0027", start=last, end=end)
+        combined = pd.concat([existing, new], ignore_index=True)
+        combined = combined.drop_duplicates(subset=["period"], keep="last")
+        combined = combined.sort_values("period").reset_index(drop=True)
+    else:
+        print(f"No existing file. Fetching from {default_start}.")
+        combined = fetch_subregion_demand(subba="0027", start=default_start, end=end)
+
+    combined.to_csv(out, index=False)
+    print(f"\nSaved {len(combined):,} rows to {out}")
+    print(f"Range: {combined['period'].min()} to {combined['period'].max()}")
