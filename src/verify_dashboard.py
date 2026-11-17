@@ -21,7 +21,7 @@ PROCESSED = ROOT / "data" / "processed" / "load_hourly.parquet"
 EXPECTED = {
     "src/eia.py": "86807549f1d5",
     "src/build_dataset.py": "ead094abf35d",
-    "app.py": "afa378cf49cd",
+    "app.py": "e731a99c8c90",
     "requirements.txt": "2b2055663bda",
 }
 
@@ -140,7 +140,7 @@ except Exception:
     check("dashboard server at http://localhost:8501", None, "not running right now (fine if you stopped it)")
 
 # ---------------------------------------------------------------- 7. git safety
-section("7. Git: nothing committed, secrets protected")
+section("7. Git: secrets protected")
 code, _ = git("ls-files", "--error-unmatch", ".env")
 check(".env is NOT tracked by git", code != 0)
 code, out = git("check-ignore", "-v", ".env")
@@ -148,7 +148,7 @@ check(".env is ignored", code == 0, out or "no ignore rule matches .env")
 code, out = git("check-ignore", "-v", "data/processed/load_hourly.parquet")
 check("processed parquet ignore status", None, out if code == 0 else "NOT ignored (can be committed for deployment)")
 _, out = git("log", "-1", "--format=%h  %cr  %s")
-check("latest commit (should be the old one, not today)", None, out)
+check("latest commit", None, out)
 _, out = git("status", "--short", "--branch")
 print("  git status:\n    " + (out.replace("\n", "\n    ") if out else "(clean)"))
 

@@ -100,6 +100,21 @@ def weather_fit(g: pd.DataFrame) -> dict | None:
     }
 
 
+@st.cache_data(show_spinner=False)
+def data_gaps(df: pd.DataFrame) -> pd.DataFrame:
+    """Per subregion: hours missing between the first and last timestamp, and summer days mostly missing."""
+    rows = []
+    for sr, g in df.groupby("subregion"):
+        have = pd.DatetimeIndex(g["timestamp_utc"]).as_unit("ns")
+        full = pd.date_range(have.min(), have.max(), freq="h").as_unit("ns")
+        missing = full.difference(have)
+        local = missing.tz_convert(SUBREGION_TZ.get(sr, DEFAULT_TZ))
+        per_day = pd.Series(1, index=local).groupby(local.date).sum()
+        summer_days = [d for d, n in per_day.items() if n >= 12 and d.month in SUMMER]
+        rows.append({"subregion": sr, "missing_hours": len(missing), "summer_days": summer_days})
+    return pd.DataFrame(rows)
+
+
 @st.cache_data(show_spinner="Building screener...")
 def build_screener(df: pd.DataFrame) -> pd.DataFrame:
     rows = []
@@ -109,6 +124,9 @@ def build_screener(df: pd.DataFrame) -> pd.DataFrame:
             continue
         last = g[g["year"] == yrs[-1]]
         peak = last["load_mw"].max()
+        rec = g.loc[g["load_mw"].idxmax()]                     # all data, including the current year
+        t = rec["ts_local"]
+        rec_when = f"{t:%b} {t.day}, {t.year}, {t.hour % 12 or 12} {'AM' if t.hour < 12 else 'PM'}"
         top = last.nlargest(TOP_N, "load_mw")
         summer_pk = last.loc[last["month"].isin(SUMMER), "load_mw"].max()
         winter_pk = last.loc[last["month"].isin(WINTER), "load_mw"].max()
@@ -122,7 +140,9 @@ def build_screener(df: pd.DataFrame) -> pd.DataFrame:
         rows.append({
             "Subregion": sr,
             "Year": yrs[-1],
-            "Peak (MW)": peak,
+            "Year peak (MW)": peak,
+            "Record peak (MW)": rec["load_mw"],
+            "Record peak (local time)": rec_when,
             "Load factor": last["load_mw"].mean() / peak,
             "Typical peak hour": int(top["hour"].mode().iloc[0]),
             f"% of top {TOP_N} hrs in summer": 100 * top["month"].isin(SUMMER).mean(),
@@ -157,6 +177,16 @@ with st.sidebar:
                f"{df['ts_local'].min():%b %Y} – {df['ts_local'].max():%b %Y} · "
                f"{len(df):,} rows")
 
+    st.subheader("Data gaps")
+    for _, r in data_gaps(df).iterrows():
+        if not r["missing_hours"]:
+            st.caption(f"**{r['subregion']}**: no missing hours.")
+            continue
+        days = ", ".join(f"{d:%b} {d.day}, {d.year}" for d in r["summer_days"])
+        st.caption(f"**{r['subregion']}**: {r['missing_hours']:,} hours missing in EIA's data."
+                   + (f" Summer days missing: {days}. A peak on those days isn't in the data."
+                      if days else ""))
+
 st.title("MISO Load Screener")
 screener = build_screener(df)
 if screener.empty:
@@ -175,7 +205,8 @@ with tab_screen:
         hide_index=True,
         column_config={
             "Year": st.column_config.NumberColumn(format="%d"),
-            "Peak (MW)": st.column_config.NumberColumn(format="%.0f"),
+            "Year peak (MW)": st.column_config.NumberColumn(format="%.0f"),
+            "Record peak (MW)": st.column_config.NumberColumn(format="%.0f"),
             "Load factor": st.column_config.NumberColumn(format="%.2f"),
             "Typical peak hour": st.column_config.NumberColumn(format="%d:00"),
             f"% of top {TOP_N} hrs in summer": st.column_config.NumberColumn(format="%.0f%%"),
@@ -197,6 +228,9 @@ with tab_screen:
 
     with st.expander("How these are calculated"):
         st.markdown(f"""
+- **Year peak**: highest hour in the latest full calendar year. **Record peak**: highest hour in all the data,
+  including the current partial year. Hours missing from EIA's data can't count, so a peak on a missing
+  day isn't captured (see Data gaps in the sidebar).
 - **Load factor**: average load ÷ peak load. Higher means a flatter, more 'baseload' profile.
 - **Typical peak hour**: most common local hour among the year's top {TOP_N} load hours.
 - **Summer/winter peak**: highest summer-month hour ÷ highest winter-month hour. Above 1 means summer-peaking.
