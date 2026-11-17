@@ -21,7 +21,9 @@ PROCESSED = ROOT / "data" / "processed" / "load_hourly.parquet"
 EXPECTED = {
     "src/eia.py": "86807549f1d5",
     "src/build_dataset.py": "ead094abf35d",
-    "app.py": "e731a99c8c90",
+    "src/metrics.py": "6132e488d569",
+    "app.py": "3fdab9f5f807",
+    "app_screener.py": "e731a99c8c90",
     "requirements.txt": "2b2055663bda",
 }
 
@@ -92,6 +94,8 @@ try:
     check("data is current (last hour within 3 days)", age_h < 72, f"last hour is {age_h:.0f} h old")
     check("no duplicate hours", int(raw['period'].duplicated().sum()) == 0, f"{int(raw['period'].duplicated().sum())} duplicates")
     check("subba codes", None, ", ".join(sorted(raw['subba'].dropna().unique())))
+    if "subba-name" in raw.columns:
+        check("EIA's name for this subregion", None, ", ".join(sorted(raw["subba-name"].dropna().astype(str).unique())))
     check("file last modified", None, f"{datetime.fromtimestamp(RAW.stat().st_mtime):%Y-%m-%d %H:%M}")
 except Exception as e:
     check("could not read raw CSV", False, f"{e.__class__.__name__}: {e}")
@@ -117,18 +121,52 @@ try:
 except Exception as e:
     check("could not read processed file", False, f"{e.__class__.__name__}: {e}")
 
-# ---------------------------------------------------------------- 6. dashboard runs
-section("6. Dashboard runs on the real data (headless test)")
+# ---------------------------------------------------------------- 6. phase 1 numbers, two ways
+section("6. Phase 1 numbers, recomputed without src/metrics.py")
+try:
+    d = df[df["subregion_code"].astype(str) == "0027"].copy()
+    d["local"] = pd.to_datetime(d["timestamp_utc"], utc=True).dt.tz_convert("America/Detroit")
+    d["yr"] = d["local"].dt.year
+    ann = d.loc[d.groupby("yr")["load_mw"].idxmax(), ["yr", "load_mw", "local", "temp_f"]].set_index("yr")
+    counts = d.groupby("yr").size()
+    print("  Annual peak hour (Eastern time):")
+    for y, r in ann.iterrows():
+        print(f"    {y}: {r.load_mw:>9,.0f} MW  at {r.local:%Y-%m-%d %H:00}  {r.temp_f:5.1f}°F  ({counts[y]:,} hours)")
+    g = (ann.loc[2025, "load_mw"] / ann.loc[2019, "load_mw"]) ** (1 / 6) - 1
+    lf = d.loc[d["yr"] == 2025, "load_mw"].mean() / d.loc[d["yr"] == 2025, "load_mw"].max()
+    check("peak growth 2019-2025, endpoint formula", None, f"{g:+.3%} per year")
+    check("load factor 2025", None, f"{lf:.3f}")
+
+    sys.path.insert(0, str(ROOT))
+    import src.metrics as m
+    s = m.summary(m.load_hourly(PROCESSED), 2025, 2019)
+    check("metrics.py 2025 peak matches", abs(s["peak_mw"] - ann.loc[2025, "load_mw"]) < 0.5,
+          f"{s['peak_mw']:,.0f} MW at {m.fmt_time(s['peak_time'])}")
+    check("metrics.py growth rate matches", abs(s["growth"] - g) < 1e-9, f"{s['growth']:+.3%}")
+    check("metrics.py load factor matches", abs(s["load_factor"] - lf) < 1e-9, f"{s['load_factor']:.3f}")
+    wa = s["weather_adjusted"]
+    check("weather-adjusted growth (cross-check)", None,
+          f"{wa['growth']:+.3%} per year over {wa['days']:,} days" if wa else "not available (no temperatures)")
+    flagged = s["peaks"].loc[s["peaks"]["lower_bound"], ["year", "missing_summer_days"]]
+    for _, r in flagged.iterrows():
+        check(f"{r['year']} peak is a lower bound", None,
+              "missing summer days: " + ", ".join(m.fmt_day(x) for x in r["missing_summer_days"]))
+except Exception as e:
+    check("recompute failed", False, f"{e.__class__.__name__}: {e}")
+
+# ---------------------------------------------------------------- 7. dashboards run
+section("7. Dashboards run on the real data (headless test)")
 try:
     from streamlit.testing.v1 import AppTest
-    at = AppTest.from_file(str(ROOT / "app.py"), default_timeout=300).run()
-    errs = [str(e.value)[:200] for e in at.exception] + [str(e.value)[:200] for e in at.error]
-    check("app runs with no errors", not errs, "; ".join(errs))
-    if at.dataframe:
-        print("  Screener table:")
-        print("    " + at.dataframe[0].value.T.to_string().replace("\n", "\n    "))
-    if at.metric:
-        print("  What-if defaults: " + " | ".join(f"{m.label}: {m.value}" for m in at.metric))
+    for name in ("app.py", "app_screener.py"):
+        if not (ROOT / name).exists():
+            check(f"{name} exists", False)
+            continue
+        at = AppTest.from_file(str(ROOT / name), default_timeout=300).run()
+        errs = [str(e.value)[:200] for e in at.exception] + [str(e.value)[:200] for e in at.error]
+        check(f"{name} runs with no errors", not errs, "; ".join(errs))
+        if name == "app.py" and at.metric:
+            print("  Summary row: " + " | ".join(f"{x.label}: {x.value}" for x in at.metric))
 except Exception as e:
     check("headless app test", False, f"{e.__class__.__name__}: {e}")
 
@@ -140,7 +178,7 @@ except Exception:
     check("dashboard server at http://localhost:8501", None, "not running right now (fine if you stopped it)")
 
 # ---------------------------------------------------------------- 7. git safety
-section("7. Git: secrets protected")
+section("8. Git: secrets protected")
 code, _ = git("ls-files", "--error-unmatch", ".env")
 check(".env is NOT tracked by git", code != 0)
 code, out = git("check-ignore", "-v", ".env")
