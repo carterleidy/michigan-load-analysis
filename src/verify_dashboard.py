@@ -21,8 +21,8 @@ PROCESSED = ROOT / "data" / "processed" / "load_hourly.parquet"
 EXPECTED = {
     "src/eia.py": "86807549f1d5",
     "src/build_dataset.py": "ead094abf35d",
-    "src/metrics.py": "6132e488d569",
-    "app.py": "3fdab9f5f807",
+    "src/metrics.py": "5c492cd5e0d8",
+    "app.py": "49cb954094b4",
     "app_screener.py": "e731a99c8c90",
     "requirements.txt": "2b2055663bda",
 }
@@ -147,6 +147,24 @@ try:
     wa = s["weather_adjusted"]
     check("weather-adjusted growth (cross-check)", None,
           f"{wa['growth']:+.3%} per year over {wa['days']:,} days" if wa else "not available (no temperatures)")
+    # seasonality, recomputed with plain groupbys and compared with metrics.py
+    dfm = m.load_hourly(PROCESSED)
+    d25 = d[d["yr"] == 2025]
+    mon, hr = d25["local"].dt.month, d25["local"].dt.hour
+    summer = d25.loc[mon.isin([6, 7, 8]), "load_mw"].max()
+    winter = d25.loc[mon.isin([12, 1, 2]), "load_mw"].max()
+    sp = m.seasonal_peaks(dfm, 2025)
+    check("metrics.py seasonal peaks match (2025)",
+          abs(sp.loc["Summer", "load_mw"] - summer) < 0.5 and abs(sp.loc["Winter", "load_mw"] - winter) < 0.5,
+          f"summer {summer:,.0f} MW, winter {winter:,.0f} MW, ratio {summer / winter:.2f}")
+    hm_indep = d25.groupby([mon, hr])["load_mw"].mean().unstack()
+    hm_diff = float((m.hour_month_avg(dfm, 2025).to_numpy() - hm_indep.to_numpy()).__abs__().max())
+    check("metrics.py hour-by-month averages match (2025)", hm_diff < 1e-6, f"largest difference {hm_diff:.2e} MW")
+    tr = m.temperature_response(dfm, 2025)
+    check("temperature response (2025)", None,
+          f"+{tr['mw_per_f_hot']:,.0f} MW per °F above 65, +{tr['mw_per_f_cold']:,.0f} MW per °F below 65"
+          if tr else "not available (no temperatures)")
+
     flagged = s["peaks"].loc[s["peaks"]["lower_bound"], ["year", "missing_summer_days"]]
     for _, r in flagged.iterrows():
         check(f"{r['year']} peak is a lower bound", None,

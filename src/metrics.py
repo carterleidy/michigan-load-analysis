@@ -131,6 +131,68 @@ def summary(df: pd.DataFrame, year: int = 2025, start: int = 2019) -> dict:
     }
 
 
+# ----------------------------------------------------------------------------- seasonality
+# MISO's four capacity-auction seasons, so the charts line up with seasonal capacity prices.
+SEASON_OF_MONTH = {12: "Winter", 1: "Winter", 2: "Winter", 3: "Spring", 4: "Spring", 5: "Spring",
+                   6: "Summer", 7: "Summer", 8: "Summer", 9: "Fall", 10: "Fall", 11: "Fall"}
+SEASONS = ["Summer", "Fall", "Winter", "Spring"]
+
+
+def hour_month_avg(df: pd.DataFrame, year: int) -> pd.DataFrame:
+    """Average load (MW) for each month (rows 1-12) and local hour of day (columns 0-23) in one year."""
+    g = df[df["year"] == year]
+    return g.pivot_table(index=g["ts_local"].dt.month, columns=g["ts_local"].dt.hour,
+                         values="load_mw", aggfunc="mean")
+
+
+def typical_day(df: pd.DataFrame, year: int) -> pd.DataFrame:
+    """Average load by local hour of day (rows 0-23) for each MISO season (columns) in one year.
+    Seasons use that calendar year's months, so 'Winter' is Jan, Feb and Dec of the same year."""
+    g = df[df["year"] == year]
+    season = g["ts_local"].dt.month.map(SEASON_OF_MONTH)
+    hour = g["ts_local"].dt.hour
+    return g.groupby([hour, season])["load_mw"].mean().unstack()[SEASONS]
+
+
+def monthly_peaks(df: pd.DataFrame) -> pd.DataFrame:
+    """Highest hourly load in each month: rows are months 1-12, columns are years."""
+    return df.pivot_table(index=df["ts_local"].dt.month, columns="year", values="load_mw", aggfunc="max")
+
+
+def seasonal_peaks(df: pd.DataFrame, year: int) -> pd.DataFrame:
+    """Peak MW and when it happened, for each MISO season in one year."""
+    g = df[df["year"] == year].assign(season=lambda x: x["ts_local"].dt.month.map(SEASON_OF_MONTH))
+    idx = g.groupby("season")["load_mw"].idxmax()
+    out = g.loc[idx, ["season", "load_mw", "ts_local", "temp_f"]].set_index("season")
+    return out.reindex(SEASONS)
+
+
+def temperature_response(df: pd.DataFrame, year: int) -> dict | None:
+    """How daily peak load responds to temperature in one year.
+
+    Fits  daily peak = a + b_cool*CDD + b_heat*HDD + c*weekend  using the day's average temperature
+    (CDD/HDD = degrees above/below 65°F). b_cool and b_heat are MW added per degree of heat or cold.
+    """
+    g = df[df["year"] == year]
+    d = (g.assign(date=g["ts_local"].dt.date)
+           .groupby("date")
+           .agg(peak=("load_mw", "max"), temp=("temp_f", "mean"), n=("load_mw", "size"))
+           .query("n >= 20")
+           .dropna())
+    if len(d) < 300:
+        return None
+    dates = pd.to_datetime(pd.Series(d.index))
+    weekend = (dates.dt.dayofweek >= 5).astype(float).to_numpy()
+    cdd = np.clip(d["temp"].to_numpy() - BASE_TEMP_F, 0, None)
+    hdd = np.clip(BASE_TEMP_F - d["temp"].to_numpy(), 0, None)
+    X = np.column_stack([np.ones(len(d)), cdd, hdd, weekend])
+    (a, b_cool, b_heat, c), *_ = np.linalg.lstsq(X, d["peak"].to_numpy(), rcond=None)
+    grid = np.linspace(d["temp"].min(), d["temp"].max(), 120)
+    fitted = a + b_cool * np.clip(grid - BASE_TEMP_F, 0, None) + b_heat * np.clip(BASE_TEMP_F - grid, 0, None)
+    return {"daily": d.reset_index(), "mw_per_f_hot": b_cool, "mw_per_f_cold": b_heat,
+            "weekend_mw": c, "curve_temp": grid, "curve_mw": fitted}
+
+
 def fmt_time(t: pd.Timestamp) -> str:
     """'Jul 14, 2026, 6 PM' (works on Windows, unlike %-I)."""
     return f"{t:%b} {t.day}, {t.year}, {t.hour % 12 or 12} {'AM' if t.hour < 12 else 'PM'}"
@@ -138,3 +200,8 @@ def fmt_time(t: pd.Timestamp) -> str:
 
 def fmt_day(d) -> str:
     return f"{d:%b} {d.day}, {d.year}"
+
+
+def fmt_hour(h: int) -> str:
+    """0 -> '12 AM', 17 -> '5 PM'."""
+    return f"{h % 12 or 12} {'AM' if h < 12 else 'PM'}"
