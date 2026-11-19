@@ -1,7 +1,8 @@
 """
 Michigan–Wisconsin transmission-need dashboard.
 
-Phase 1 (real EIA-930 data only): header, summary row, annual peak chart, seasonality, methods and limits.
+Phase 1 (real EIA-930 data): header, summary row, annual peak chart, seasonality, methods and limits.
+Phase 2 (hand-built, sourced tables): large-load tracker, projection lines, computed headline.
 All calculations live in src/metrics.py; this file only lays them out.
 
 Run from the project root:   streamlit run app.py
@@ -13,17 +14,31 @@ import calendar
 import plotly.graph_objects as go
 import streamlit as st
 
-from src.metrics import (BASE_TEMP_F, PROCESSED, SEASONS, fmt_day, fmt_hour, fmt_time, hour_month_avg,
-                         load_hourly, monthly_peaks, seasonal_peaks, summary, temperature_response,
-                         typical_day)
+from src.metrics import (BASE_TEMP_F, LARGE_LOADS, PLANNED_TX, PROCESSED, SEASONS, fmt_day, fmt_hour,
+                         fmt_time, headline_share, hour_month_avg, load_hourly, monthly_peaks,
+                         read_large_loads, read_planned_transmission, scenario_table, seasonal_peaks,
+                         summary, temperature_response, typical_day)
 
-REPORT_YEAR, START_YEAR = 2025, 2019
-BLUE, ORANGE, INK_2, GRID = "#2a78d6", "#eb6834", "#52514e", "rgba(128,128,128,0.18)"
+REPORT_YEAR, START_YEAR, HEADLINE_YEAR = 2025, 2019, 2030
+PROJECTION_YEARS = list(range(REPORT_YEAR, 2033))          # 2025 (actual) through 2032
+BLUE, ORANGE, INK_2, GRAY, GRID = "#2a78d6", "#eb6834", "#52514e", "#8a8985", "rgba(128,128,128,0.18)"
 SEASON_COLORS = {"Summer": "#2a78d6", "Fall": "#eb6834", "Winter": "#1baf7a", "Spring": "#eda100"}
 SEQ_BLUE = [[0.0, "#cde2fb"], [0.25, "#86b6ef"], [0.5, "#3987e5"], [0.75, "#1c5cab"], [1.0, "#0d366b"]]
 HOUR_TICKS = list(range(0, 24, 3))
 
 st.set_page_config(page_title="MI–WI Transmission Need", layout="wide")
+
+
+def end_labels(fig, x, values: dict, colors: dict, y_span: float):
+    """Direct labels at the right end of each line, nudged apart so they don't overlap.
+    y_span is the chart's full y-range in data units; labels stay at least 7% of it apart."""
+    items = sorted(values.items(), key=lambda kv: kv[1])
+    min_gap, placed = y_span * 0.07, []
+    for name, y in items:
+        y = max(y, placed[-1] + min_gap) if placed else y
+        placed.append(y)
+        fig.add_annotation(x=x, y=y, text=name, showarrow=False, xanchor="left", xshift=6,
+                           font=dict(color=colors[name], size=12))
 
 if not PROCESSED.exists():
     st.error("No processed data yet. In the VS Code terminal (project root) run "
@@ -41,14 +56,60 @@ def get_data(path: str, modified: float):
 df, s = get_data(str(PROCESSED), PROCESSED.stat().st_mtime)
 peaks = s["peaks"]
 
+
+@st.cache_data(show_spinner=False)
+def get_inputs(loads_path: str, tx_path: str, modified: float):
+    """Hand-built tables. `modified` refreshes the cache whenever either CSV is edited."""
+    return read_large_loads(loads_path), read_planned_transmission(tx_path)
+
+
+loads, tx = get_inputs(str(LARGE_LOADS), str(PLANNED_TX), LARGE_LOADS.stat().st_mtime + PLANNED_TX.stat().st_mtime)
+
+# ----------------------------------------------------------------------------- scenario settings (sidebar)
+with st.sidebar:
+    st.header("Scenario settings")
+    st.caption("These change the projection lines, the headline and the tracker totals.")
+    wa = s["weather_adjusted"]
+    growth_choice = st.radio(
+        "Underlying growth rate",
+        ["Endpoint (2019 vs. 2025 peak)", "Weather-adjusted"] if wa else ["Endpoint (2019 vs. 2025 peak)"],
+        help="Endpoint compares two single hours, so weather moves it a lot. Weather-adjusted holds temperature constant.",
+    )
+    g = wa["growth"] if growth_choice == "Weather-adjusted" else s["growth"]
+    draw = st.slider("Share of announced MW drawn at the peak hour", 50, 100, 100, step=5,
+                     help="100% follows the brief: data centers run near full size at the peak hour.") / 100
+    include_undated = st.checkbox("Include loads with no firm online date",
+                                  help="Adds them in full from the year you pick. That year is an assumption.")
+    undated_year = st.selectbox("Assumed online year for those loads", list(range(2027, 2033)), index=3,
+                                disabled=not include_undated)
+
+sc = scenario_table(s["peak_mw"], g, loads, PROJECTION_YEARS, draw=draw,
+                    undated_year=undated_year if include_undated else None, base_year=REPORT_YEAR)
+x_share = headline_share(sc, HEADLINE_YEAR)
+big_line = tx.sort_values(["voltage_kv", "in_service_dt"], ascending=[False, False]).iloc[0]
+years_before = big_line["in_service_dt"].year - HEADLINE_YEAR
+counted = loads[loads["counted"]]
+dated_gw = counted.loc[counted["dated"], "mw"].sum() / 1000
+undated_gw = counted.loc[~counted["dated"], "mw"].sum() / 1000
+
 # ----------------------------------------------------------------------------- 1. header
 st.title("Is the Michigan–Wisconsin region heading toward a transmission need?")
 st.markdown(
     "**Region:** MISO Zones 2 + 7, covering most of Michigan and Wisconsin. EIA reports the two zones as one number.  \n"
     f"**Data:** EIA Form 930 hourly demand, {fmt_day(df['timestamp_utc'].min())} – "
     f"{fmt_day(df['timestamp_utc'].max())}. Times are shown in Eastern time.  \n"
-    "**Real vs. sample:** every number on this page is real EIA data. Panels added later that use "
-    "hand-built tables or sample values will be labeled."
+    "**Real vs. hand-built:** load history, peaks and seasonality are real EIA data. Large loads and planned "
+    "transmission come from hand-built tables, with a public source for every row. Nothing on this page is sample data."
+)
+
+short = big_line["project"].split(" (")[0]
+st.info(
+    f"**Announced data centers could add about {x_share:.0%} to the region's peak by {HEADLINE_YEAR}, "
+    f"roughly {years_before} years before the biggest new line ({short}, {big_line['voltage_kv']:.0f} kV) "
+    f"is due in service ({big_line['in_service_dt']:%B %Y}).**  \n"
+    f"Settings: {growth_choice.lower()} growth ({g:+.2%}/yr), {draw:.0%} of announced MW at the peak hour, "
+    + (f"undated loads included from {undated_year}." if include_undated else "loads with no firm date left out.")
+    + " Uses real EIA peaks plus the hand-built large-load table."
 )
 
 # ----------------------------------------------------------------------------- 2. summary row
@@ -63,7 +124,6 @@ with c1:
 
 with c2:
     st.metric(f"Peak growth {START_YEAR}–{REPORT_YEAR}", f"{s['growth']:+.2%} / yr")
-    wa = s["weather_adjusted"]
     st.caption(f"Compares two single hours, so weather moves it a lot. Weather-adjusted: "
                f"{wa['growth']:+.2%} / yr." if wa else "Compares two single hours, so weather moves it a lot.")
 
@@ -72,17 +132,18 @@ with c3:
     st.caption("Average hour ÷ peak hour. Lower means a peakier load.")
 
 with c4:
-    st.metric("Tracked large loads", "Phase 2")
-    st.caption("Comes from large_loads.csv (hand-built and sourced) in Phase 2.")
+    st.metric("Tracked large loads", f"{dated_gw:.1f} GW")
+    st.caption(f"Announced loads with firm dates, counted once. Another {undated_gw:.1f} GW has no firm date. "
+               "From the hand-built large-load table.")
 
 # ----------------------------------------------------------------------------- 3. annual peak chart
-st.subheader("Annual peak hour")
+st.subheader("Annual peak hour: actuals and two projections")
 
 latest = peaks["year"].max()
 plot = peaks[peaks["full_year"] | (peaks["year"] == latest)].copy()     # drops the 5-hour stub of 2018
 plot["label"] = [f"{y} (to date)" if not full else str(y) for y, full in zip(plot["year"], plot["full_year"])]
-plot["text"] = [f"{mw / 1000:.1f} GW" + (" *" if lb else "")
-                for mw, lb in zip(plot["peak_mw"], plot["lower_bound"])]
+plot["text"] = [f"{mw / 1000:.1f} GW" + (" *" if lb else "") + ("<br>to date" if not full else "")
+                for mw, lb, full in zip(plot["peak_mw"], plot["lower_bound"], plot["full_year"])]
 plot["hover"] = [
     f"<b>{r.label}</b><br>Peak: {r.peak_mw:,.0f} MW<br>{fmt_time(r.peak_time)} Eastern"
     f"<br>Temperature: {r.peak_temp_f:.0f}°F"
@@ -92,8 +153,7 @@ plot["hover"] = [
 ]
 
 fig = go.Figure(go.Bar(
-    x=plot["label"], y=plot["peak_mw"],
-    text=plot["text"], textposition="outside", textfont=dict(color=INK_2),
+    x=plot["year"], y=plot["peak_mw"], name="Actual annual peak (EIA)",
     hovertext=plot["hover"], hoverinfo="text",
     marker=dict(
         color=BLUE,
@@ -102,14 +162,30 @@ fig = go.Figure(go.Bar(
         cornerradius=4,
     ),
 ))
+line_colors = {"Trend only": GRAY, "Trend + announced large loads": ORANGE}
+marker_sizes = [0] + [8] * (len(sc) - 1)           # no marker on the starting point (the 2025 bar top)
+fig.add_scatter(x=sc["year"], y=sc["trend_mw"], name="Trend only", mode="lines+markers",
+                line=dict(color=GRAY, width=2, dash="dash"), marker=dict(size=marker_sizes),
+                hovertemplate="%{x} trend only: %{y:,.0f} MW<extra></extra>")
+fig.add_scatter(x=sc["year"], y=sc["scenario_mw"], name="Trend + announced large loads", mode="lines+markers",
+                line=dict(color=ORANGE, width=2), marker=dict(size=marker_sizes),
+                customdata=sc["added_mw"],
+                hovertemplate="%{x} trend + loads: %{y:,.0f} MW<br>(large loads add %{customdata:,.0f} MW)<extra></extra>")
+last = sc.iloc[-1]
+y_top = max(sc["scenario_mw"].max(), plot["peak_mw"].max()) * 1.12
+end_labels(fig, last["year"], {"Trend only": last["trend_mw"], "Trend + announced large loads": last["scenario_mw"]},
+           line_colors, y_span=y_top)
 fig.update_layout(
-    height=380, margin=dict(t=20, b=10, l=60, r=10), showlegend=False,
-    yaxis=dict(title="MW", range=[0, plot["peak_mw"].max() * 1.15], gridcolor=GRID, tickformat=",.0f"),
-    xaxis=dict(title=None),
+    height=420, margin=dict(t=20, b=10, l=60, r=190), legend=dict(orientation="h", y=-0.12),
+    yaxis=dict(title="MW", range=[0, y_top], gridcolor=GRID, tickformat=",.0f"),
+    xaxis=dict(title=None, tickmode="linear", dtick=1,
+               range=[plot["year"].min() - 0.6, PROJECTION_YEARS[-1] + 0.6]),
 )
 st.plotly_chart(fig)
-st.caption("Hatched bars with * are lower bounds: EIA is missing at least one summer day that year. "
-           "The faded bar is the current year so far. Projections for 2026–2032 come in Phase 2.")
+st.caption(f"Bars are real EIA peaks; hover for values, or open the table below. Hatched bars are lower bounds "
+           f"(EIA is missing at least one summer day that year); the faded bar is {latest} so far. Both lines start at the {REPORT_YEAR} peak and grow at "
+           f"{g:+.2%}/yr; the orange line adds the large loads at each year's July peak, based on their online "
+           f"and full-load dates.")
 
 with st.expander("Annual peaks as a table"):
     table = plot.assign(
@@ -126,22 +202,43 @@ with st.expander("Annual peaks as a table"):
         "missing_summer_days": "Missing summer days",
     })
 
+# ----------------------------------------------------------------------------- 4. large-load tracker
+st.subheader("Large-load tracker")
+st.caption("**Hand-built from public sources, one source link per row.** MW are contracted or announced capacity, "
+           "not measured load. Rows marked \"inside We Energies total\" are listed for context only: We Energies' "
+           "3.9 GW planning figure already covers them, so they aren't added twice.")
+
+status_txt = {True: "Yes", False: "No (inside We Energies total)"}
+tracker = loads.assign(
+    in_scenario=[("Yes" if r["dated"] else "Only if undated loads are included") if r["counted"]
+                 else status_txt[False] for _, r in loads.iterrows()],
+    mw_fmt=loads["mw"],
+)[["site", "state", "customer", "utility", "mw_fmt", "online_start", "full_load", "status", "in_scenario", "source_url"]]
+st.dataframe(tracker, hide_index=True, column_config={
+    "site": "Site", "state": "State", "customer": "Customer", "utility": "Utility",
+    "mw_fmt": st.column_config.NumberColumn("MW", format="%.0f"),
+    "online_start": "Online start", "full_load": "Full load", "status": "Status",
+    "in_scenario": "Counted in scenario",
+    "source_url": st.column_config.LinkColumn("Source", display_text="source"),
+})
+
+with st.expander("Notes for each row (how the dates and MW were read from the sources)"):
+    for _, r in loads.iterrows():
+        extra = f" Other sources: {r['other_sources']}" if r["other_sources"] else ""
+        st.markdown(f"- **{r['site']}**: {r['note']}{extra}")
+
+with st.expander(f"Large-load MW added at each July peak, {PROJECTION_YEARS[0]}–{PROJECTION_YEARS[-1]}"):
+    per = sc.set_index("year")[[c for c in sc.columns if c.startswith("MW: ")]].T
+    per.index = [i.removeprefix("MW: ") for i in per.index]
+    per.loc["Total added"] = per.sum()
+    per.columns = [str(c) for c in per.columns]
+    st.dataframe(per.round(0), column_config={c: st.column_config.NumberColumn(c, format="%.0f")
+                                              for c in per.columns})
+
 # ----------------------------------------------------------------------------- 3b. seasonality
 st.subheader("Seasonality: when is the system most stressed?")
 full_years = peaks.loc[peaks["full_year"], "year"].tolist()
 yr = st.selectbox("Year for the seasonal views", full_years[::-1], key="season_year")
-
-
-def end_labels(fig, x, values: dict, colors: dict, y_span: float):
-    """Direct labels at the right end of each line, nudged apart so they don't overlap.
-    y_span is the chart's full y-range in data units; labels stay at least 7% of it apart."""
-    items = sorted(values.items(), key=lambda kv: kv[1])
-    min_gap, placed = y_span * 0.07, []
-    for name, y in items:
-        y = max(y, placed[-1] + min_gap) if placed else y
-        placed.append(y)
-        fig.add_annotation(x=x, y=y, text=name, showarrow=False, xanchor="left", xshift=6,
-                           font=dict(color=colors[name], size=12))
 
 
 left, right = st.columns(2)
@@ -278,11 +375,29 @@ with st.expander("Methods and limits"):
     )
     st.latex(r"\text{DailyPeak}_d = a + b_{\text{cool}}\,\text{CDD}_d + b_{\text{heat}}\,\text{HDD}_d + c\,\text{Weekend}_d")
     st.markdown(r"$b_{\text{cool}}$ and $b_{\text{heat}}$ are the MW added per degree above or below 65°F.")
+    st.markdown("**Projections and headline (Phase 2)**")
+    st.latex(rf"\text{{Trend}}_t = \text{{Peak}}_{{{REPORT_YEAR}}}\,(1+g)^{{t-{REPORT_YEAR}}}")
+    st.latex(r"\text{Scenario}_t = \text{Trend}_t + d \sum_k \text{MW}_k \, s_k(t)")
+    st.latex(r"s_k(t) = \min\!\left(1,\ \max\!\left(0,\ \frac{\text{July 1}_t - \text{online}_k}{\text{full}_k - \text{online}_k}\right)\right)")
+    st.latex(rf"X = \frac{{\text{{Scenario}}_{{{HEADLINE_YEAR}}} - \text{{Trend}}_{{{HEADLINE_YEAR}}}}}{{\text{{Trend}}_{{{HEADLINE_YEAR}}}}}")
+    st.markdown(
+        "- $d$ is the share of announced MW drawn at the peak hour (sidebar; 100% by default). "
+        "$s_k(t)$ is the share of load $k$ running by July 1 of year $t$, since this region peaks in July.\n"
+        "- A load ramps in a straight line from its online date to its full-load date. With no full-load date "
+        "it switches on all at once. A load that starts in December adds nothing to that year's summer peak.\n"
+        "- Year-only dates are treated as December of that year, so they count from the next summer.\n"
+        "- We Energies' 3.9 GW is spread evenly over the five years the utility cited (May 2026–May 2031). "
+        "That even ramp is an assumption; the utility hasn't published year-by-year figures.\n"
+        "- Loads with no firm online date are left out unless you include them in the sidebar, with an assumed year."
+    )
     st.markdown("**Limits**")
     st.markdown(
         "- Zones 2 + 7 are reported as one number, so any Michigan vs. Wisconsin split comes only from the "
-        "hand-built tables added later.\n"
+        "hand-built tables.\n"
         "- This is a demand-side screen, not a grid study. Real transmission studies use power-flow models "
         "and grid data that aren't public.\n"
-        "- Endpoint growth compares two single hours, so a hot or mild summer in either year moves it a lot."
+        "- Endpoint growth compares two single hours, so a hot or mild summer in either year moves it a lot.\n"
+        f"- The {REPORT_YEAR} peak the projections start from is a lower bound if EIA is missing a summer day that year.\n"
+        "- Announced MW are contract or planning figures. Real draw at the peak hour, timing and cancellations can differ.\n"
+        "- The tracker only covers announcements found in public sources; more projects are in utility pipelines."
     )

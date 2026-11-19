@@ -193,6 +193,83 @@ def temperature_response(df: pd.DataFrame, year: int) -> dict | None:
             "weekend_mw": c, "curve_temp": grid, "curve_mw": fitted}
 
 
+# ----------------------------------------------------------------------------- phase 2: large loads and scenario
+INPUTS = ROOT / "inputs"
+LARGE_LOADS = INPUTS / "large_loads.csv"
+PLANNED_TX = INPUTS / "planned_transmission.csv"
+PEAK_MONTH = 7      # this region's annual peaks fall in July, so loads are counted as of July 1 each year
+
+
+def read_large_loads(path: Path = LARGE_LOADS) -> pd.DataFrame:
+    """Hand-built table of announced large loads, one row per site (or per utility total).
+
+    count_in_scenario = 'no' marks rows already inside another row (the We Energies total),
+    so they're listed for context but never added twice.
+    """
+    ll = pd.read_csv(path, dtype=str, keep_default_na=False)
+    ll["mw"] = pd.to_numeric(ll["mw"], errors="coerce")
+    ll["online_dt"] = pd.to_datetime(ll["online_start"], format="%Y-%m", errors="coerce")
+    ll["full_dt"] = pd.to_datetime(ll["full_load"], format="%Y-%m", errors="coerce")
+    ll["counted"] = ll["count_in_scenario"].str.strip().str.lower().eq("yes")
+    ll["dated"] = ll["online_dt"].notna()
+    return ll
+
+
+def read_planned_transmission(path: Path = PLANNED_TX) -> pd.DataFrame:
+    """Hand-built table of planned transmission projects."""
+    tx = pd.read_csv(path, dtype=str, keep_default_na=False)
+    for col in ("voltage_kv", "miles", "cost_usd_m"):
+        tx[col] = pd.to_numeric(tx[col], errors="coerce")
+    tx["in_service_dt"] = pd.to_datetime(tx["in_service"], format="%Y-%m", errors="coerce")
+    return tx
+
+
+def share_online(online, full, year: int) -> float:
+    """Share of a load's MW running at the summer peak (July 1) of `year`.
+
+    Ramps in a straight line from the online date to the full-load date. With no full-load
+    date it switches on all at once. A load that starts in December adds nothing to that
+    year's summer peak.
+    """
+    if pd.isna(online):
+        return 0.0
+    t = pd.Timestamp(year=year, month=PEAK_MONTH, day=1)
+    if pd.isna(full) or full <= online:
+        return float(t >= online)
+    return float(np.clip((t - online) / (full - online), 0.0, 1.0))
+
+
+def scenario_table(peak_base: float, g: float, loads: pd.DataFrame, years, draw: float = 1.0,
+                   undated_year: int | None = None, base_year: int = 2025) -> pd.DataFrame:
+    """One row per year: trend-only peak, MW added by large loads, and trend + loads.
+
+    trend_mw    = peak_base * (1 + g)^(year - base_year)
+    added_mw    = draw * sum over counted loads of MW * share_online(...)
+    Loads with no online date are added in full from `undated_year` on, or left out if it's None.
+    """
+    use = loads[loads["counted"]]
+    rows = []
+    for y in years:
+        trend = peak_base * (1 + g) ** (y - base_year)
+        per_load = {}
+        for _, r in use.iterrows():
+            if r["dated"]:
+                share = share_online(r["online_dt"], r["full_dt"], y)
+            else:
+                share = float(undated_year is not None and y >= undated_year)
+            per_load[r["site"]] = r["mw"] * share * draw
+        added = sum(per_load.values())
+        rows.append({"year": y, "trend_mw": trend, "added_mw": added, "scenario_mw": trend + added,
+                     **{f"MW: {k}": v for k, v in per_load.items()}})
+    return pd.DataFrame(rows)
+
+
+def headline_share(sc: pd.DataFrame, year: int = 2030) -> float:
+    """X in the headline: large-load MW at the summer peak of `year` as a share of the trend-only peak."""
+    r = sc.set_index("year").loc[year]
+    return r["added_mw"] / r["trend_mw"]
+
+
 def fmt_time(t: pd.Timestamp) -> str:
     """'Jul 14, 2026, 6 PM' (works on Windows, unlike %-I)."""
     return f"{t:%b} {t.day}, {t.year}, {t.hour % 12 or 12} {'AM' if t.hour < 12 else 'PM'}"

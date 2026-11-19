@@ -8,6 +8,7 @@ Paste the full output back into the chat to have it reviewed.
 
 import hashlib
 import os
+import re
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -21,10 +22,12 @@ PROCESSED = ROOT / "data" / "processed" / "load_hourly.parquet"
 EXPECTED = {
     "src/eia.py": "86807549f1d5",
     "src/build_dataset.py": "ead094abf35d",
-    "src/metrics.py": "5c492cd5e0d8",
-    "app.py": "49cb954094b4",
+    "src/metrics.py": "bddca4365bb9",
+    "app.py": "339f34aa3dd4",
     "app_screener.py": "e731a99c8c90",
     "requirements.txt": "2b2055663bda",
+    "inputs/large_loads.csv": "6a232d69d3a2",
+    "inputs/planned_transmission.csv": "720e15b029ea",
 }
 
 results = []
@@ -171,6 +174,61 @@ try:
               "missing summer days: " + ", ".join(m.fmt_day(x) for x in r["missing_summer_days"]))
 except Exception as e:
     check("recompute failed", False, f"{e.__class__.__name__}: {e}")
+
+# ---------------------------------------------------------------- 6b. phase 2 inputs and headline
+section("6b. Phase 2: hand-built tables and the headline, recomputed")
+try:
+    import csv
+    for name in ("inputs/large_loads.csv", "inputs/planned_transmission.csv"):
+        with open(ROOT / name, newline="", encoding="utf-8") as f:
+            rows = list(csv.DictReader(f))
+        no_src = [r.get("site") or r.get("project") for r in rows if not r["source_url"].startswith("http")]
+        check(f"{name}: every row has a source link", not no_src, f"{len(rows)} rows" + (f"; missing: {no_src}" if no_src else ""))
+        bad_dates = [v for r in rows for k, v in r.items()
+                     if k in ("online_start", "full_load", "selected", "in_service") and v and not re.fullmatch(r"\d{4}-\d{2}", v)]
+        check(f"{name}: dates are blank or YYYY-MM", not bad_dates, ", ".join(bad_dates))
+
+    with open(ROOT / "inputs/large_loads.csv", newline="", encoding="utf-8") as f:
+        ll = list(csv.DictReader(f))
+    not_counted = [r for r in ll if r["count_in_scenario"].strip().lower() != "yes"]
+    check("rows left out of the scenario say what total covers them",
+          all("We Energies" in r["note"] for r in not_counted), ", ".join(r["site"] for r in not_counted))
+
+    # headline X with default settings, computed by hand (month counting, no metrics.py)
+    def months(ym):
+        y_, m_ = map(int, ym.split("-"))
+        return y_ * 12 + (m_ - 1)
+
+    peak25 = ann.loc[2025, "load_mw"]
+    g_end = (ann.loc[2025, "load_mw"] / ann.loc[2019, "load_mw"]) ** (1 / 6) - 1
+    totals = {}
+    for year in range(2025, 2033):
+        july = year * 12 + 6
+        added = 0.0
+        for r in ll:
+            if r["count_in_scenario"].strip().lower() != "yes" or not r["online_start"]:
+                continue
+            on = months(r["online_start"])
+            full = months(r["full_load"]) if r["full_load"] else on
+            share = (1.0 if july >= on else 0.0) if full <= on else min(1.0, max(0.0, (july - on) / (full - on)))
+            added += float(r["mw"]) * share
+        totals[year] = (peak25 * (1 + g_end) ** (year - 2025), added)
+    x_hand = totals[2030][1] / totals[2030][0]
+    print("  Large-load MW at each July peak (default settings): "
+          + ", ".join(f"{y}: {a:,.0f}" for y, (_, a) in totals.items()))
+
+    loads_m = m.read_large_loads()
+    sc_m = m.scenario_table(s["peak_mw"], s["growth"], loads_m, range(2025, 2033))
+    x_m = m.headline_share(sc_m, 2030)
+    check("headline X matches metrics.py (default settings)", abs(x_hand - x_m) < 0.002,
+          f"by hand {x_hand:.1%}, metrics.py {x_m:.1%}; {totals[2030][1]:,.0f} MW on a "
+          f"{totals[2030][0]:,.0f} MW trend-only 2030 peak")
+    tx_m = m.read_planned_transmission()
+    big = tx_m.sort_values(["voltage_kv", "in_service_dt"], ascending=[False, False]).iloc[0]
+    check("biggest planned line used in the headline", None,
+          f"{big['project']}: {big['voltage_kv']:.0f} kV, in service {big['in_service']}")
+except Exception as e:
+    check("phase 2 checks failed", False, f"{e.__class__.__name__}: {e}")
 
 # ---------------------------------------------------------------- 7. dashboards run
 section("7. Dashboards run on the real data (headless test)")
