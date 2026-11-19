@@ -22,12 +22,13 @@ PROCESSED = ROOT / "data" / "processed" / "load_hourly.parquet"
 EXPECTED = {
     "src/eia.py": "86807549f1d5",
     "src/build_dataset.py": "ead094abf35d",
-    "src/metrics.py": "bddca4365bb9",
-    "app.py": "339f34aa3dd4",
+    "src/metrics.py": "67bcc950bf93",
+    "app.py": "68f3eca7324b",
     "app_screener.py": "e731a99c8c90",
     "requirements.txt": "2b2055663bda",
-    "inputs/large_loads.csv": "6a232d69d3a2",
-    "inputs/planned_transmission.csv": "720e15b029ea",
+    "inputs/large_loads.csv": "246bc6cee99e",
+    "inputs/planned_transmission.csv": "6d09eb1d732c",
+    "inputs/state_rules.csv": "595d046768d2",
 }
 
 results = []
@@ -176,16 +177,17 @@ except Exception as e:
     check("recompute failed", False, f"{e.__class__.__name__}: {e}")
 
 # ---------------------------------------------------------------- 6b. phase 2 inputs and headline
-section("6b. Phase 2: hand-built tables and the headline, recomputed")
+section("6b. Hand-built tables, headline and state cards, recomputed")
 try:
     import csv
-    for name in ("inputs/large_loads.csv", "inputs/planned_transmission.csv"):
+    for name in ("inputs/large_loads.csv", "inputs/planned_transmission.csv", "inputs/state_rules.csv"):
         with open(ROOT / name, newline="", encoding="utf-8") as f:
             rows = list(csv.DictReader(f))
-        no_src = [r.get("site") or r.get("project") for r in rows if not r["source_url"].startswith("http")]
+        no_src = [r.get("site") or r.get("project") or r.get("topic") for r in rows if not r["source_url"].startswith("http")]
         check(f"{name}: every row has a source link", not no_src, f"{len(rows)} rows" + (f"; missing: {no_src}" if no_src else ""))
         bad_dates = [v for r in rows for k, v in r.items()
-                     if k in ("online_start", "full_load", "selected", "in_service") and v and not re.fullmatch(r"\d{4}-\d{2}", v)]
+                     if k in ("online_start", "full_load", "selected", "in_service", "in_service_latest", "as_of")
+                     and v and not re.fullmatch(r"\d{4}-\d{2}", v)]
         check(f"{name}: dates are blank or YYYY-MM", not bad_dates, ", ".join(bad_dates))
 
     with open(ROOT / "inputs/large_loads.csv", newline="", encoding="utf-8") as f:
@@ -224,9 +226,20 @@ try:
           f"by hand {x_hand:.1%}, metrics.py {x_m:.1%}; {totals[2030][1]:,.0f} MW on a "
           f"{totals[2030][0]:,.0f} MW trend-only 2030 peak")
     tx_m = m.read_planned_transmission()
-    big = tx_m.sort_values(["voltage_kv", "in_service_dt"], ascending=[False, False]).iloc[0]
-    check("biggest planned line used in the headline", None,
+    big = m.biggest_regional_line(tx_m)
+    check("headline line is a named MI/WI line with a date", big["kind"] == "line" and big["state"] in ("MI", "WI"),
           f"{big['project']}: {big['voltage_kv']:.0f} kV, in service {big['in_service']}")
+
+    # Phase 3: state totals in the Michigan vs. Wisconsin cards, recomputed from the CSV
+    for code in ("MI", "WI"):
+        dated = sum(float(r["mw"]) for r in ll if r["state"] == code and r["count_in_scenario"].strip().lower() == "yes"
+                    and r["online_start"])
+        check(f"{code} card: tracked large loads with firm dates", None, f"{dated / 1000:.2f} GW")
+    with open(ROOT / "inputs/state_rules.csv", newline="", encoding="utf-8") as f:
+        rules_rows = list(csv.DictReader(f))
+    for code in ("MI", "WI"):
+        topics = [r["topic"] for r in rules_rows if r["state"] == code]
+        check(f"{code} card: state-rule topics", "Who can build" in topics, "; ".join(topics))
 except Exception as e:
     check("phase 2 checks failed", False, f"{e.__class__.__name__}: {e}")
 

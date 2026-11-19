@@ -216,12 +216,33 @@ def read_large_loads(path: Path = LARGE_LOADS) -> pd.DataFrame:
 
 
 def read_planned_transmission(path: Path = PLANNED_TX) -> pd.DataFrame:
-    """Hand-built table of planned transmission projects."""
+    """Hand-built table of planned transmission.
+
+    kind = 'line' (one named line), 'portfolio' (a state's share or MISO's whole plan),
+    or 'benchmark' (outside the region, used only for cost comparison).
+    """
     tx = pd.read_csv(path, dtype=str, keep_default_na=False)
     for col in ("voltage_kv", "miles", "cost_usd_m"):
         tx[col] = pd.to_numeric(tx[col], errors="coerce")
-    tx["in_service_dt"] = pd.to_datetime(tx["in_service"], format="%Y-%m", errors="coerce")
+    for col in ("selected", "in_service", "in_service_latest"):
+        tx[f"{col}_dt"] = pd.to_datetime(tx[col], format="%Y-%m", errors="coerce")
+    tx["cost_per_mile_m"] = tx["cost_usd_m"] / tx["miles"]
     return tx
+
+
+def biggest_regional_line(tx: pd.DataFrame) -> pd.Series:
+    """The highest-voltage named line in Michigan or Wisconsin with an in-service date
+    (latest date breaks ties). The headline compares large-load timing against this line."""
+    lines = tx[(tx["kind"] == "line") & tx["state"].isin(["MI", "WI"]) & tx["in_service_dt"].notna()]
+    return lines.sort_values(["voltage_kv", "in_service_dt"], ascending=[False, False]).iloc[0]
+
+
+STATE_RULES = INPUTS / "state_rules.csv"
+
+
+def read_state_rules(path: Path = STATE_RULES) -> pd.DataFrame:
+    """Hand-built table of state rules and risks: one row per state and topic, each with a source."""
+    return pd.read_csv(path, dtype=str, keep_default_na=False)
 
 
 def share_online(online, full, year: int) -> float:

@@ -14,10 +14,13 @@ import calendar
 import plotly.graph_objects as go
 import streamlit as st
 
-from src.metrics import (BASE_TEMP_F, LARGE_LOADS, PLANNED_TX, PROCESSED, SEASONS, fmt_day, fmt_hour,
-                         fmt_time, headline_share, hour_month_avg, load_hourly, monthly_peaks,
-                         read_large_loads, read_planned_transmission, scenario_table, seasonal_peaks,
-                         summary, temperature_response, typical_day)
+import pandas as pd
+
+from src.metrics import (BASE_TEMP_F, LARGE_LOADS, PLANNED_TX, PROCESSED, SEASONS, STATE_RULES,
+                         biggest_regional_line, fmt_day, fmt_hour, fmt_time, headline_share, hour_month_avg,
+                         load_hourly, monthly_peaks, read_large_loads, read_planned_transmission,
+                         read_state_rules, scenario_table, seasonal_peaks, summary, temperature_response,
+                         typical_day)
 
 REPORT_YEAR, START_YEAR, HEADLINE_YEAR = 2025, 2019, 2030
 PROJECTION_YEARS = list(range(REPORT_YEAR, 2033))          # 2025 (actual) through 2032
@@ -58,12 +61,13 @@ peaks = s["peaks"]
 
 
 @st.cache_data(show_spinner=False)
-def get_inputs(loads_path: str, tx_path: str, modified: float):
-    """Hand-built tables. `modified` refreshes the cache whenever either CSV is edited."""
-    return read_large_loads(loads_path), read_planned_transmission(tx_path)
+def get_inputs(loads_path: str, tx_path: str, rules_path: str, modified: float):
+    """Hand-built tables. `modified` refreshes the cache whenever any of the CSVs is edited."""
+    return read_large_loads(loads_path), read_planned_transmission(tx_path), read_state_rules(rules_path)
 
 
-loads, tx = get_inputs(str(LARGE_LOADS), str(PLANNED_TX), LARGE_LOADS.stat().st_mtime + PLANNED_TX.stat().st_mtime)
+loads, tx, rules = get_inputs(str(LARGE_LOADS), str(PLANNED_TX), str(STATE_RULES),
+                              sum(p.stat().st_mtime for p in (LARGE_LOADS, PLANNED_TX, STATE_RULES)))
 
 # ----------------------------------------------------------------------------- scenario settings (sidebar)
 with st.sidebar:
@@ -86,7 +90,7 @@ with st.sidebar:
 sc = scenario_table(s["peak_mw"], g, loads, PROJECTION_YEARS, draw=draw,
                     undated_year=undated_year if include_undated else None, base_year=REPORT_YEAR)
 x_share = headline_share(sc, HEADLINE_YEAR)
-big_line = tx.sort_values(["voltage_kv", "in_service_dt"], ascending=[False, False]).iloc[0]
+big_line = biggest_regional_line(tx)
 years_before = big_line["in_service_dt"].year - HEADLINE_YEAR
 counted = loads[loads["counted"]]
 dated_gw = counted.loc[counted["dated"], "mw"].sum() / 1000
@@ -98,8 +102,9 @@ st.markdown(
     "**Region:** MISO Zones 2 + 7, covering most of Michigan and Wisconsin. EIA reports the two zones as one number.  \n"
     f"**Data:** EIA Form 930 hourly demand, {fmt_day(df['timestamp_utc'].min())} – "
     f"{fmt_day(df['timestamp_utc'].max())}. Times are shown in Eastern time.  \n"
-    "**Real vs. hand-built:** load history, peaks and seasonality are real EIA data. Large loads and planned "
-    "transmission come from hand-built tables, with a public source for every row. Nothing on this page is sample data."
+    "**Real vs. hand-built:** load history, peaks and seasonality are real EIA data. Large loads, planned "
+    "transmission and the state rules come from hand-built tables, with a public source for every row. "
+    "Nothing on this page is sample data."
 )
 
 short = big_line["project"].split(" (")[0]
@@ -234,6 +239,125 @@ with st.expander(f"Large-load MW added at each July peak, {PROJECTION_YEARS[0]}�
     per.columns = [str(c) for c in per.columns]
     st.dataframe(per.round(0), column_config={c: st.column_config.NumberColumn(c, format="%.0f")
                                               for c in per.columns})
+
+# ----------------------------------------------------------------------------- 5. planned transmission + timing gap
+st.subheader("Planned transmission and the timing gap")
+st.caption("**Hand-built from public sources, one source link per row.** In-service dates are the dates MISO "
+           "requires the lines to be running by. EASL is in Iowa, outside this region, and is listed only as a "
+           "cost benchmark.")
+
+tx_table = tx.assign(
+    cost_per_mile=tx["cost_per_mile_m"].where(tx["kind"].isin(["line", "benchmark"])),   # not meaningful for portfolios
+    in_service_show=[f"{a[:4]} to {b[:4]}" if b else (a or "not set")          # ranges are year-only
+                     for a, b in zip(tx["in_service"], tx["in_service_latest"])],
+)[["project", "kind", "state", "voltage_kv", "miles", "cost_usd_m", "cost_per_mile", "developer",
+   "how_selected", "in_service_show", "status", "source_url"]]
+st.dataframe(tx_table, hide_index=True, column_config={
+    "project": "Project", "kind": "Type", "state": "State",
+    "voltage_kv": st.column_config.NumberColumn("kV", format="%d"),
+    "miles": st.column_config.NumberColumn("Miles", format="%d"),
+    "cost_usd_m": st.column_config.NumberColumn("Cost ($M)", format="%.0f"),
+    "cost_per_mile": st.column_config.NumberColumn("$M per mile", format="%.1f",
+                                                   help="Cost ÷ miles. For EASL the cost also covers a substation and "
+                                                        "22 miles of 345 kV line, so this overstates the line-only cost."),
+    "developer": "Developer", "how_selected": "How selected", "in_service_show": "In service by",
+    "status": "Status", "source_url": st.column_config.LinkColumn("Source", display_text="source"),
+})
+with st.expander("Notes for each project"):
+    for _, r in tx.iterrows():
+        extra = f" Other sources: {r['other_sources']}" if r["other_sources"] else ""
+        st.markdown(f"- **{r['project']}**: {r['note']}{extra}")
+
+# timing-gap chart: when the tracked loads come online vs. when the new lines are due
+regional = tx[tx["state"].isin(["MI", "WI"]) & tx["in_service_dt"].notna()]
+named_states = set(regional.loc[regional["kind"] == "line", "state"])
+tl_lines = regional[(regional["kind"] == "line") | ~regional["state"].isin(named_states)]
+tl_loads = loads[loads["counted"] & loads["dated"]]
+
+rows = []
+for _, r in tl_loads.iterrows():
+    end = r["full_dt"] if pd.notna(r["full_dt"]) else r["online_dt"]
+    rows.append({"label": f"{r['site'].split(' (')[0]} ({r['state']}, {r['mw'] / 1000:.1f} GW)", "group": "load",
+                 "start": r["online_dt"], "end": end, "latest": pd.NaT,
+                 "hover": f"{r['site']}<br>{r['mw']:,.0f} MW · online {r['online_start']}"
+                          + (f" · full load {r['full_load']}" if r["full_load"] else "")})
+for _, r in tl_lines.sort_values("in_service_dt").iterrows():
+    kv = f"{r['voltage_kv']:.0f} kV" if pd.notna(r["voltage_kv"]) and r["kind"] == "line" else ""   # portfolios mix voltages
+    rows.append({"label": f"{r['project'].split(' (')[0]} ({r['state']}{', ' + kv if kv else ''})", "group": "line",
+                 "start": r["selected_dt"], "end": r["in_service_dt"], "latest": r["in_service_latest_dt"],
+                 "hover": f"{r['project']}<br>selected/approved {r['selected']} · in service by {r['in_service']}"
+                          + (f" to {r['in_service_latest']}" if r["in_service_latest"] else "")})
+tl = pd.DataFrame(rows)
+
+fig_tl = go.Figure()
+group_style = {"load": (ORANGE, "Large load: online → full load"), "line": (BLUE, "New line: approved/selected → in service")}
+shown = set()
+for _, r in tl.iterrows():
+    color, legend_name = group_style[r["group"]]
+    first = r["group"] not in shown
+    shown.add(r["group"])
+    fig_tl.add_scatter(x=[r["start"], r["end"]], y=[r["label"], r["label"]], mode="lines+markers",
+                       line=dict(color=color, width=10), marker=dict(size=[8, 12], symbol=["circle", "diamond"], color=color),
+                       name=legend_name, legendgroup=r["group"], showlegend=first,
+                       hovertext=r["hover"], hoverinfo="text")
+    if pd.notna(r["latest"]):
+        fig_tl.add_scatter(x=[r["end"], r["latest"]], y=[r["label"], r["label"]], mode="lines",
+                           line=dict(color=color, width=10, dash="dot"), opacity=0.45, showlegend=False,
+                           hovertext=r["hover"], hoverinfo="text")
+headline_date = pd.Timestamp(year=HEADLINE_YEAR, month=7, day=1)
+fig_tl.add_vline(x=headline_date, line=dict(color=GRAY, dash="dash", width=1.5))
+fig_tl.add_annotation(x=headline_date, y=1.02, yref="paper", text=f"July {HEADLINE_YEAR} (headline)",
+                      showarrow=False, font=dict(color=INK_2, size=11))
+fig_tl.update_layout(
+    height=120 + 42 * len(tl), margin=dict(t=45, b=10, l=10, r=20), legend=dict(orientation="h", y=-0.15),
+    xaxis=dict(type="date", range=[pd.Timestamp("2024-06-01"), pd.Timestamp("2035-06-30")], gridcolor=GRID, dtick="M12",
+               tickformat="%Y"),
+    yaxis=dict(autorange="reversed", automargin=True),
+)
+st.plotly_chart(fig_tl)
+
+named = tl_lines[tl_lines["kind"] == "line"].sort_values("in_service_dt")
+added_2030 = sc.set_index("year").loc[HEADLINE_YEAR, "added_mw"]
+st.caption(
+    f"By July {HEADLINE_YEAR}, about {added_2030 / 1000:.1f} GW of the tracked loads are running at current settings. "
+    + (f"The first named new line is due {named.iloc[0]['in_service_dt']:%B %Y} "
+       f"({named.iloc[0]['project'].split(' (')[0]}); the biggest, {short}, {big_line['in_service_dt']:%B %Y}. "
+       if len(named) else "")
+    + "Dotted ends show a date range: Michigan's Tranche 2.1 lines only have the portfolio-wide window (2032–2034). "
+    "Lines without any in-service date (for example ITC's Oneida–Sabine Lake) aren't drawn."
+)
+
+# ----------------------------------------------------------------------------- 6. Michigan vs. Wisconsin
+st.subheader("Michigan vs. Wisconsin")
+st.caption("**Hand-built from public sources.** EIA reports Zones 2 and 7 as one number, so this split comes only "
+           "from the tables above and the state-rules table. Zone 7 is Michigan's Lower Peninsula; Zone 2 is mostly "
+           "eastern Wisconsin plus Michigan's Upper Peninsula.")
+card_cols = st.columns(2)
+for col, code, name in [(card_cols[0], "MI", "Michigan"), (card_cols[1], "WI", "Wisconsin")]:
+    with col, st.container(border=True):
+        st.markdown(f"#### {name}")
+        state_loads = loads[loads["counted"] & (loads["state"] == code)]
+        dated_mw = state_loads.loc[state_loads["dated"], "mw"].sum()
+        undated_mw = state_loads.loc[~state_loads["dated"], "mw"].sum()
+        portfolio = tx[(tx["kind"] == "portfolio") & (tx["state"] == code)]
+        k1, k2 = st.columns(2)
+        k1.metric("Tracked large loads", f"{dated_mw / 1000:.1f} GW",
+                  help="Loads with firm dates, counted once." + (f" Plus {undated_mw / 1000:.1f} GW with no firm date."
+                                                                 if undated_mw else ""))
+        k2.metric("Tranche 2.1 investment", f"${portfolio['cost_usd_m'].sum() / 1000:.1f}B" if len(portfolio) else "n/a")
+        if undated_mw:
+            st.caption(f"Plus {undated_mw / 1000:.1f} GW of announced load with no firm date.")
+        st.markdown("**New lines**")
+        for _, r in tx[(tx["state"] == code) & (tx["kind"] == "line")].iterrows():
+            bits = [f"{r['voltage_kv']:.0f} kV" if pd.notna(r["voltage_kv"]) else None,
+                    f"~{r['miles']:.0f} mi" if pd.notna(r["miles"]) else None,
+                    f"${r['cost_usd_m'] / 1000:.2f}B" if pd.notna(r["cost_usd_m"]) else None,
+                    f"in service by {r['in_service_dt']:%b %Y}" if pd.notna(r["in_service_dt"]) else "no in-service date yet"]
+            st.markdown(f"- {r['project'].split(' (')[0]}: " + ", ".join(b for b in bits if b) + f" ({r['how_selected']})")
+        for _, r in portfolio.iterrows():
+            st.markdown(f"- Tranche 2.1 overall: {r['note']}")
+        for _, r in rules[rules["state"] == code].iterrows():
+            st.markdown(f"**{r['topic']}:** {r['finding']} [source]({r['source_url']})")
 
 # ----------------------------------------------------------------------------- 3b. seasonality
 st.subheader("Seasonality: when is the system most stressed?")
@@ -389,6 +513,19 @@ with st.expander("Methods and limits"):
         "- We Energies' 3.9 GW is spread evenly over the five years the utility cited (May 2026–May 2031). "
         "That even ramp is an assumption; the utility hasn't published year-by-year figures.\n"
         "- Loads with no firm online date are left out unless you include them in the sidebar, with an assumed year."
+    )
+    st.markdown("**Transmission timing and state cards (Phase 3)**")
+    st.markdown(
+        "- The headline's \"biggest new line\" is the highest-voltage named line in Michigan or Wisconsin that has an "
+        "in-service date (BECI, 765 kV).\n"
+        "- Timing chart: a load's bar runs from its online date to its full-load date; a line's bar runs from MISO "
+        "approval or developer selection to its required in-service date. Dotted ends are date ranges.\n"
+        "- Cost per mile is cost ÷ miles. For EASL, the cost also covers about 22 miles of 345 kV line and a new "
+        "substation, so it overstates the 765 kV line-only cost.\n"
+        "- Context on build times: at MISO's January 2026 large-load workshop, large loads were described as going "
+        "from site selection to operation in 18 months to three years, new generation in about four years, and "
+        "major transmission upgrades in seven to ten years "
+        "([summary](https://www.zeroemissiongrid.com/zeg-blog/miso-large-load-additions/))."
     )
     st.markdown("**Limits**")
     st.markdown(
